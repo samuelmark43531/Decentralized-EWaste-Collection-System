@@ -134,3 +134,137 @@
         (ok true)
     )
 )
+
+
+(define-constant ERR-NO-ACTIVE-DISPUTE (err u105))
+(define-constant ERR-DISPUTE-EXISTS (err u106))
+(define-constant ERR-NOT-DISPUTE-PARTY (err u107))
+(define-constant ERR-DISPUTE-RESOLVED (err u108))
+
+(define-map disputes
+    uint
+    {
+        pickup-id: uint,
+        requester: principal,
+        collector: principal,
+        reason: (string-ascii 100),
+        requester-evidence: (optional (string-ascii 200)),
+        collector-evidence: (optional (string-ascii 200)),
+        status: (string-ascii 20),
+        resolution: (optional (string-ascii 100)),
+        timestamp: uint
+    }
+)
+
+(define-data-var dispute-counter uint u0)
+
+;; Function to file a dispute
+(define-public (file-dispute (pickup-id uint) (reason (string-ascii 100)))
+    (let
+        (
+            (pickup (unwrap! (map-get? pickups pickup-id) ERR-INVALID-PICKUP))
+            (collector (unwrap! (get collector pickup) ERR-INVALID-PICKUP))
+            (dispute-id (+ (var-get dispute-counter) u1))
+        )
+        ;; Only requester or collector can file a dispute
+        (asserts! (or (is-eq tx-sender (get requester pickup)) 
+                      (is-eq tx-sender collector)) 
+                  ERR-NOT-AUTHORIZED)
+        
+        ;; Dispute can only be filed for ACCEPTED or COMPLETED pickups
+        (asserts! (or (is-eq (get status pickup) "ACCEPTED") 
+                      (is-eq (get status pickup) "COMPLETED")) 
+                  ERR-INVALID-STATUS)
+        
+        ;; Create the dispute
+        (map-set disputes dispute-id {
+            pickup-id: pickup-id,
+            requester: (get requester pickup),
+            collector: collector,
+            reason: reason,
+            requester-evidence: none,
+            collector-evidence: none,
+            status: "OPEN",
+            resolution: none,
+            timestamp: stacks-block-height
+        })
+        
+        ;; Update pickup status to DISPUTED
+        (map-set pickups pickup-id (merge pickup {
+            status: "DISPUTED"
+        }))
+        
+        (var-set dispute-counter dispute-id)
+        (ok dispute-id)
+    )
+)
+
+;; Function to submit evidence
+(define-public (submit-evidence (dispute-id uint) (evidence (string-ascii 200)))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) ERR-NO-ACTIVE-DISPUTE))
+        )
+        ;; Only parties involved can submit evidence
+        (asserts! (or (is-eq tx-sender (get requester dispute)) 
+                      (is-eq tx-sender (get collector dispute))) 
+                  ERR-NOT-DISPUTE-PARTY)
+        
+        ;; Dispute must be open
+        (asserts! (is-eq (get status dispute) "OPEN") ERR-DISPUTE-RESOLVED)
+        
+        ;; Update the appropriate evidence field
+        (if (is-eq tx-sender (get requester dispute))
+            (map-set disputes dispute-id (merge dispute {
+                requester-evidence: (some evidence)
+            }))
+            (map-set disputes dispute-id (merge dispute {
+                collector-evidence: (some evidence)
+            }))
+        )
+        
+        (ok true)
+    )
+)
+
+;; Function for admin to resolve dispute
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-ascii 100)) (refund-percentage uint))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) ERR-NO-ACTIVE-DISPUTE))
+            (pickup-id (get pickup-id dispute))
+            (pickup (unwrap! (map-get? pickups pickup-id) ERR-INVALID-PICKUP))
+            (refund-amount (/ (* (get reward pickup) refund-percentage) u100))
+        )
+        ;; Only admin can resolve disputes
+        (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+        
+        ;; Dispute must be open
+        (asserts! (is-eq (get status dispute) "OPEN") ERR-DISPUTE-RESOLVED)
+        
+        ;; If refund is needed, transfer from contract to requester
+        (if (> refund-amount u0)
+            (try! (as-contract (stx-transfer? refund-amount tx-sender (get requester dispute))))
+            true
+        )
+        
+        ;; Update dispute status
+        (map-set disputes dispute-id (merge dispute {
+            status: "RESOLVED",
+            resolution: (some resolution)
+        }))
+        
+        ;; Update pickup status
+        (map-set pickups pickup-id (merge pickup {
+            status: "RESOLVED"
+        }))
+        
+        (ok true)
+    )
+)
+
+;; Read-only function to get dispute details
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes dispute-id)
+)
+
