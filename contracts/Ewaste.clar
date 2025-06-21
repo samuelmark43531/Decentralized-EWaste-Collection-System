@@ -268,3 +268,181 @@
     (map-get? disputes dispute-id)
 )
 
+(define-constant ERR-INSUFFICIENT-REPUTATION (err u109))
+(define-constant ERR-INVALID-RATING (err u110))
+
+(define-data-var min-reputation-threshold uint u50)
+
+(define-map collector-reputation
+    principal
+    {
+        total-score: uint,
+        completed-pickups: uint,
+        average-rating: uint,
+        on-time-deliveries: uint,
+        disputes-against: uint,
+        reputation-level: (string-ascii 20)
+    }
+)
+
+(define-map pickup-ratings
+    uint
+    {
+        rated: bool,
+        rating: uint,
+        feedback: (optional (string-ascii 100))
+    }
+)
+
+(define-public (rate-pickup (pickup-id uint) (rating uint) (feedback (optional (string-ascii 100))))
+    (let
+        (
+            (pickup (unwrap! (map-get? pickups pickup-id) ERR-INVALID-PICKUP))
+            (collector (unwrap! (get collector pickup) ERR-INVALID-PICKUP))
+            (existing-rating (map-get? pickup-ratings pickup-id))
+        )
+        (asserts! (is-eq tx-sender (get requester pickup)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status pickup) "COMPLETED") ERR-INVALID-STATUS)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (is-none existing-rating) ERR-ALREADY-CLAIMED)
+        
+        (map-set pickup-ratings pickup-id {
+            rated: true,
+            rating: rating,
+            feedback: feedback
+        })
+        
+        (update-collector-reputation collector rating)
+        (ok true)
+    )
+)
+
+(define-private (update-collector-reputation (collector principal) (new-rating uint))
+    (let
+        (
+            (current-rep (default-to {
+                total-score: u0,
+                completed-pickups: u0,
+                average-rating: u0,
+                on-time-deliveries: u0,
+                disputes-against: u0,
+                reputation-level: "BRONZE"
+            } (map-get? collector-reputation collector)))
+            (new-total-score (+ (get total-score current-rep) new-rating))
+            (new-completed (+ (get completed-pickups current-rep) u1))
+            (new-average (/ new-total-score new-completed))
+            (new-level (calculate-reputation-level new-average new-completed))
+        )
+        (map-set collector-reputation collector {
+            total-score: new-total-score,
+            completed-pickups: new-completed,
+            average-rating: new-average,
+            on-time-deliveries: (get on-time-deliveries current-rep),
+            disputes-against: (get disputes-against current-rep),
+            reputation-level: new-level
+        })
+    )
+)
+
+(define-private (calculate-reputation-level (average-rating uint) (completed-pickups uint))
+    (if (and (>= average-rating u4) (>= completed-pickups u50))
+        "GOLD"
+        (if (and (>= average-rating u3) (>= completed-pickups u20))
+            "SILVER"
+            "BRONZE"
+        )
+    )
+)
+
+(define-public (accept-pickup-with-reputation-check (pickup-id uint))
+    (let
+        (
+            (pickup (unwrap! (map-get? pickups pickup-id) ERR-INVALID-PICKUP))
+            (collector-rep (map-get? collector-reputation tx-sender))
+        )
+        (asserts! (is-eq (get status pickup) "PENDING") ERR-INVALID-STATUS)
+        
+        (match collector-rep
+            rep (asserts! (>= (get average-rating rep) (var-get min-reputation-threshold)) ERR-INSUFFICIENT-REPUTATION)
+            true
+        )
+        
+        (ok (map-set pickups pickup-id (merge pickup {
+            status: "ACCEPTED",
+            collector: (some tx-sender)
+        })))
+    )
+)
+
+(define-private (update-dispute-reputation (collector principal))
+    (let
+        (
+            (current-rep (default-to {
+                total-score: u0,
+                completed-pickups: u0,
+                average-rating: u0,
+                on-time-deliveries: u0,
+                disputes-against: u0,
+                reputation-level: "BRONZE"
+            } (map-get? collector-reputation collector)))
+        )
+        (map-set collector-reputation collector (merge current-rep {
+            disputes-against: (+ (get disputes-against current-rep) u1)
+        }))
+    )
+)
+
+(define-public (resolve-dispute-with-reputation (dispute-id uint) (resolution (string-ascii 100)) (refund-percentage uint) (penalize-collector bool))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) ERR-NO-ACTIVE-DISPUTE))
+            (pickup-id (get pickup-id dispute))
+            (pickup (unwrap! (map-get? pickups pickup-id) ERR-INVALID-PICKUP))
+            (refund-amount (/ (* (get reward pickup) refund-percentage) u100))
+        )
+        (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status dispute) "OPEN") ERR-DISPUTE-RESOLVED)
+        
+        (if (> refund-amount u0)
+            (try! (as-contract (stx-transfer? refund-amount tx-sender (get requester dispute))))
+            true
+        )
+        
+        (if penalize-collector
+            (update-dispute-reputation (get collector dispute))
+            true
+        )
+        
+        (map-set disputes dispute-id (merge dispute {
+            status: "RESOLVED",
+            resolution: (some resolution)
+        }))
+        
+        (map-set pickups pickup-id (merge pickup {
+            status: "RESOLVED"
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-collector-reputation (collector principal))
+    (map-get? collector-reputation collector)
+)
+
+(define-read-only (get-pickup-rating (pickup-id uint))
+    (map-get? pickup-ratings pickup-id)
+)
+
+(define-read-only (get-top-collectors (limit uint))
+    (ok "Query top collectors by reputation - implement off-chain indexing")
+)
+
+(define-public (set-min-reputation-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-threshold u5) ERR-INVALID-RATING)
+        (var-set min-reputation-threshold new-threshold)
+        (ok true)
+    )
+)
